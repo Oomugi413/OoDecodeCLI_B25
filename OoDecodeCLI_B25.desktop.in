@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OoDecodeCLI B25
+Comment=ARIB STD-B25 transport stream decoder
+Exec=@PROJECT_DIR@/run.sh %F
+TryExec=@PROJECT_DIR@/run.sh
+Path=@PROJECT_DIR@
+Terminal=false
+Categories=AudioVideo;
+MimeType=video/mp2t;video/mpeg;
