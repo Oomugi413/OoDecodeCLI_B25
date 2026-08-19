@@ -23,6 +23,7 @@ Linux上で録画TS/M2TSを、ARIB STD-B25復号する小さな独立ツール�
 - `arib-b25-stream-test`
 - `ffprobe`（FFmpegに含まれます）
 - Python 3.10以降とTkinter（GUIを使う場合。Debian/Ubuntuなら通常 `python3-tk`）
+- `zenity`（Linux GUIのファイル選択画面。利用できない場合はTkの選択画面へフォールバック）
 - `arib-b25-stream-test` がリンクする `libaribb25`（通常はパッケージの実行時依存）
 
 確認例:
@@ -32,6 +33,7 @@ command -v arib-b25-stream-test
 command -v ffprobe
 ldd "$(command -v arib-b25-stream-test)" | grep -i aribb25
 python3 -c 'import tkinter; print("Tkinter OK")'
+zenity --version
 ```
 
 `arib-b25-stream-test` や `ffprobe` が標準の `PATH` にない場合は、環境変数でも指定できます。
@@ -54,7 +56,9 @@ cd ~/git/OoDecodeCLI_B25
 ./run.sh
 ```
 
-ウィンドウの「ファイル追加…」で複数ファイルを選べます。デスクトップ上のランチャーへファイルをドロップして起動時の一覧へ渡すこともできます。ランチャーを一度登録するには:
+ウィンドウの「ファイル追加…」で複数ファイルを選べます。GNOME/Wayland環境ではZenityのGTK選択画面を使用します。Tk 8.6標準選択画面で深いディレクトリの上層メニューがクリック解放時に閉じる問題を回避するためです。直前に選択したフォルダは次回も引き継がれます。
+
+デスクトップ上のランチャーへファイルをドロップして起動時の一覧へ渡すこともできます。ランチャーを一度登録するには:
 
 ```bash
 cd ~/git/OoDecodeCLI_B25

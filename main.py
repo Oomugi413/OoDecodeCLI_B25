@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -440,7 +441,13 @@ class DecoderApp:
         self.root = root
         self.decoder = decoder
         self.ffprobe = ffprobe
+        self.zenity = shutil.which("zenity")
         self.paths: list[Path] = []
+        self.last_directory = (
+            Path(initial_paths[0]).expanduser().parent
+            if initial_paths
+            else Path.cwd()
+        )
         self.running = False
         self.messages: queue.Queue[object] = queue.Queue()
 
@@ -511,15 +518,67 @@ class DecoderApp:
         self.listbox.insert(self.tk.END, str(path))
 
     def add_files(self) -> None:
-        paths = self.filedialog.askopenfilenames(
-            title="復号するTS/M2TSを選択",
-            filetypes=[
-                ("TS / M2TS", "*.ts *.TS *.m2ts *.M2TS"),
-                ("すべてのファイル", "*"),
-            ],
-        )
+        paths = self._select_files_with_zenity()
+        if paths is None:
+            paths = self.filedialog.askopenfilenames(
+                title="復号するTS/M2TSを選択",
+                initialdir=str(self.last_directory),
+                filetypes=[
+                    ("TS / M2TS", "*.ts *.TS *.m2ts *.M2TS"),
+                    ("すべてのファイル", "*"),
+                ],
+            )
         for path in paths:
             self.add_path(Path(path))
+        if paths:
+            self.last_directory = Path(paths[0]).expanduser().parent
+
+    def _select_files_with_zenity(self) -> tuple[str, ...] | None:
+        """Use GNOME's native GTK picker, avoiding Tk's X11 menu bug.
+
+        ``None`` means Zenity could not be used and the caller should fall
+        back to Tk's dialog.  An empty tuple means the user cancelled.
+        """
+
+        if self.zenity is None:
+            return None
+
+        initial_name = str(self.last_directory) + os.sep
+        command = [
+            self.zenity,
+            "--file-selection",
+            "--multiple",
+            "--title=復号するTS/M2TSを選択",
+            "--separator=\n",
+            f"--filename={initial_name}",
+            "--file-filter=TS / M2TS | *.ts *.TS *.m2ts *.M2TS",
+            "--file-filter=すべてのファイル | *",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            self.write_log(
+                f"Zenityを起動できないためTk選択画面を使用します: {exc}"
+            )
+            self.zenity = None
+            return None
+
+        if completed.returncode == 0:
+            return tuple(path for path in completed.stdout.splitlines() if path)
+        if completed.returncode == 1:
+            return ()
+
+        detail = _stderr_tail(completed.stderr)
+        self.write_log(
+            "Zenityのファイル選択に失敗したためTk選択画面を使用します"
+            + (f": {detail}" if detail else "。")
+        )
+        return None
 
     def remove_selected(self) -> None:
         selected = list(self.listbox.curselection())
