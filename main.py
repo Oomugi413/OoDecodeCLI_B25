@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from urllib.parse import unquote, urlparse
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
@@ -443,9 +444,12 @@ class DecoderApp:
         self.ffprobe = ffprobe
         self.zenity = shutil.which("zenity")
         self.paths: list[Path] = []
+        first_path = (
+            _drop_value_to_path(initial_paths[0]) if initial_paths else None
+        )
         self.last_directory = (
-            Path(initial_paths[0]).expanduser().parent
-            if initial_paths
+            first_path.parent
+            if first_path is not None
             else Path.cwd()
         )
         self.running = False
@@ -504,8 +508,10 @@ class DecoderApp:
         self.log_text = tk.Text(frame, height=8, state="disabled", wrap="word")
         self.log_text.pack(fill="both", expand=False)
 
-        for path in initial_paths:
-            self.add_path(Path(path))
+        for value in initial_paths:
+            path = _drop_value_to_path(value)
+            if path is not None:
+                self.add_path(path)
         if initial_paths:
             self.write_log(f"起動時に {len(initial_paths)} 件を追加しました。")
         self._poll_messages()
@@ -679,7 +685,355 @@ class DecoderApp:
             )
 
 
-def _gui_main(
+def _drop_value_to_path(value: str) -> Path | None:
+    """Convert a file-manager DnD URI or plain path into a local path."""
+
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or value.startswith("#"):
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme == "file":
+        if parsed.netloc not in ("", "localhost"):
+            return None
+        return Path(unquote(parsed.path))
+    if parsed.scheme:
+        return None
+    return Path(value)
+
+
+class GtkDecoderApp:
+    """GTK3 front end with native file-manager drag-and-drop support."""
+
+    def __init__(self, Gtk, Gdk, GLib, initial_paths, *, decoder, ffprobe):
+        self.Gtk = Gtk
+        self.Gdk = Gdk
+        self.GLib = GLib
+        self.decoder = decoder
+        self.ffprobe = ffprobe
+        self.paths: list[Path] = []
+        self.running = False
+        self.messages: queue.Queue[object] = queue.Queue()
+        first_path = (
+            _drop_value_to_path(initial_paths[0]) if initial_paths else None
+        )
+        self.last_directory = (
+            first_path.parent
+            if first_path is not None
+            else Path.cwd()
+        )
+
+        self.window = Gtk.Window(title="OoDecodeCLI B25")
+        self.window.set_default_size(760, 500)
+        self.window.set_border_width(12)
+        self.window.connect("destroy", Gtk.main_quit)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.drop_area = Gtk.EventBox()
+        self.window.add(self.drop_area)
+        self.drop_area.add(outer)
+        self.drop_label = Gtk.Label(
+            label=(
+                "TS / M2TSをここへドラッグ＆ドロップするか、"
+                "「ファイル追加…」を押してください。\n"
+                "入力は .ts.ts にリネームされ、元の名前に復号結果を作成します。"
+            )
+        )
+        self.drop_label.set_xalign(0)
+        self.drop_label.set_line_wrap(True)
+        outer.pack_start(self.drop_label, False, False, 0)
+
+        self.store = Gtk.ListStore(str)
+        self.tree = Gtk.TreeView(model=self.store)
+        self.tree.set_headers_visible(False)
+        selection = self.tree.get_selection()
+        selection.set_mode(Gtk.SelectionMode.MULTIPLE)
+        renderer = Gtk.CellRendererText()
+        column = Gtk.TreeViewColumn("対象ファイル", renderer, text=0)
+        self.tree.append_column(column)
+        self.tree_scroll = Gtk.ScrolledWindow()
+        self.tree_scroll.set_policy(
+            Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
+        )
+        self.tree_scroll.add(self.tree)
+        outer.pack_start(self.tree_scroll, True, True, 0)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        outer.pack_start(buttons, False, False, 0)
+        self.add_button = Gtk.Button(label="ファイル追加…")
+        self.add_button.connect("clicked", self.add_files)
+        buttons.pack_start(self.add_button, False, False, 0)
+        self.remove_button = Gtk.Button(label="選択削除")
+        self.remove_button.connect("clicked", self.remove_selected)
+        buttons.pack_start(self.remove_button, False, False, 0)
+        self.clear_button = Gtk.Button(label="一覧をクリア")
+        self.clear_button.connect("clicked", self.clear_files)
+        buttons.pack_start(self.clear_button, False, False, 0)
+        self.close_button = Gtk.Button(label="終了")
+        self.close_button.connect("clicked", lambda *_: self.window.destroy())
+        buttons.pack_end(self.close_button, False, False, 0)
+        self.start_button = Gtk.Button(label="復号開始")
+        self.start_button.connect("clicked", self.start_processing)
+        buttons.pack_end(self.start_button, False, False, 0)
+
+        self.log_buffer = Gtk.TextBuffer()
+        self.log_view = Gtk.TextView(buffer=self.log_buffer)
+        self.log_view.set_editable(False)
+        self.log_view.set_cursor_visible(False)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        log_scroll = Gtk.ScrolledWindow()
+        log_scroll.set_min_content_height(110)
+        log_scroll.add(self.log_view)
+        outer.pack_start(log_scroll, False, True, 0)
+
+        # Gtk's XDND handling accepts the standard URI list emitted by GNOME
+        # Files/Nautilus, as well as plain text paths from other file managers.
+        for widget in (
+            self.drop_area,
+            self.drop_label,
+            self.tree,
+            self.tree_scroll,
+            self.log_view,
+            self.add_button,
+            self.remove_button,
+            self.clear_button,
+            self.close_button,
+            self.start_button,
+        ):
+            self._enable_drop(widget)
+
+        for value in initial_paths:
+            path = _drop_value_to_path(value)
+            if path is not None:
+                self.add_path(path)
+        if initial_paths:
+            self.write_log(f"起動時に {len(initial_paths)} 件を追加しました。")
+        GLib.timeout_add(100, self._poll_messages)
+
+    def _enable_drop(self, widget) -> None:
+        targets = [
+            self.Gtk.TargetEntry.new("text/uri-list", 0, 0),
+            self.Gtk.TargetEntry.new("text/plain", 0, 1),
+            self.Gtk.TargetEntry.new("x-special/gnome-copied-files", 0, 2),
+        ]
+        widget.drag_dest_set(
+            self.Gtk.DestDefaults.ALL,
+            targets,
+            self.Gdk.DragAction.COPY,
+        )
+        widget.connect("drag-data-received", self._on_drag_data_received)
+
+    def _on_drag_data_received(
+        self, widget, context, x, y, selection_data, info, timestamp
+    ) -> None:
+        if self.running:
+            context.finish(False, False, timestamp)
+            return
+        values = selection_data.get_uris() or []
+        if values and values[0] in {"copy", "cut"}:
+            values = values[1:]
+        if not values:
+            text = selection_data.get_text() or ""
+            values = text.splitlines()
+            if values and values[0] in {"copy", "cut"}:
+                values = values[1:]
+        added = 0
+        for value in values:
+            path = _drop_value_to_path(value)
+            if path is None:
+                continue
+            before = len(self.paths)
+            self.add_path(path)
+            added += int(len(self.paths) > before)
+        context.finish(added > 0, False, timestamp)
+        if added:
+            self.write_log(f"ドラッグ＆ドロップで {added} 件を追加しました。")
+        else:
+            self.write_log("ドロップされたデータからファイルを認識できませんでした。")
+
+    def add_path(self, path: Path) -> None:
+        path = path.expanduser()
+        if path in self.paths:
+            return
+        self.paths.append(path)
+        self.store.append([str(path)])
+
+    def add_files(self, *_args) -> None:
+        dialog = self.Gtk.FileChooserDialog(
+            title="復号するTS/M2TSを選択",
+            parent=self.window,
+            action=self.Gtk.FileChooserAction.OPEN,
+            buttons=(
+                "キャンセル",
+                self.Gtk.ResponseType.CANCEL,
+                "追加",
+                self.Gtk.ResponseType.ACCEPT,
+            ),
+        )
+        dialog.set_select_multiple(True)
+        if self.last_directory.is_dir():
+            dialog.set_current_folder(str(self.last_directory))
+        media_filter = self.Gtk.FileFilter()
+        media_filter.set_name("TS / M2TS")
+        for pattern in ("*.ts", "*.TS", "*.m2ts", "*.M2TS"):
+            media_filter.add_pattern(pattern)
+        dialog.add_filter(media_filter)
+        all_filter = self.Gtk.FileFilter()
+        all_filter.set_name("すべてのファイル")
+        all_filter.add_pattern("*")
+        dialog.add_filter(all_filter)
+        response = dialog.run()
+        paths = dialog.get_filenames() if response == self.Gtk.ResponseType.ACCEPT else []
+        dialog.destroy()
+        for path in paths:
+            self.add_path(Path(path))
+        if paths:
+            self.last_directory = Path(paths[0]).expanduser().parent
+
+    def remove_selected(self, *_args) -> None:
+        selection = self.tree.get_selection()
+        model, rows = selection.get_selected_rows()
+        indices = sorted(
+            (row.get_indices()[0] for row in rows), reverse=True
+        )
+        for index in indices:
+            tree_iter = model.get_iter(self.Gtk.TreePath.new_from_indices([index]))
+            model.remove(tree_iter)
+            del self.paths[index]
+
+    def clear_files(self, *_args) -> None:
+        self.store.clear()
+        self.paths.clear()
+
+    def write_log(self, message: str) -> None:
+        end = self.log_buffer.get_end_iter()
+        self.log_buffer.insert(end, message + "\n")
+        mark = self.log_buffer.create_mark(None, self.log_buffer.get_end_iter(), False)
+        self.log_view.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+        self.log_buffer.delete_mark(mark)
+
+    def _poll_messages(self) -> bool:
+        try:
+            while True:
+                message = self.messages.get_nowait()
+                if (
+                    isinstance(message, tuple)
+                    and len(message) == 2
+                    and message[0] == "finished"
+                ):
+                    self._processing_finished(message[1])
+                else:
+                    self.write_log(str(message))
+        except queue.Empty:
+            pass
+        return True
+
+    def _set_controls(self, enabled: bool) -> None:
+        for button in (
+            self.add_button,
+            self.remove_button,
+            self.clear_button,
+            self.start_button,
+            self.close_button,
+        ):
+            button.set_sensitive(enabled)
+
+    def start_processing(self, *_args) -> None:
+        if self.running:
+            return
+        if not self.paths:
+            self.write_log("ファイルを追加してください。")
+            return
+        paths = list(self.paths)
+        self.running = True
+        self._set_controls(False)
+        self.write_log(f"{len(paths)} 件を順番に処理します。")
+
+        def worker() -> None:
+            try:
+                results = process_many(
+                    paths,
+                    decoder=self.decoder,
+                    ffprobe=self.ffprobe,
+                    progress=self.messages.put,
+                )
+                self.messages.put(("finished", results))
+            except Exception as exc:
+                self.messages.put(
+                    (
+                        "finished",
+                        [
+                            JobResult(
+                                input_path=path,
+                                status="error",
+                                message=f"ERROR: 予期しない例外: {exc}",
+                            )
+                            for path in paths
+                        ],
+                    )
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _processing_finished(self, results: Sequence[JobResult]) -> None:
+        self.running = False
+        self._set_controls(True)
+        failures = sum(result.status == "error" for result in results)
+        self.write_log(f"処理完了: {len(results)} 件（エラー {failures} 件）。")
+        message_type = (
+            self.Gtk.MessageType.ERROR if failures else self.Gtk.MessageType.INFO
+        )
+        text = (
+            f"{failures} 件でエラーが発生しました。ログとファイルを確認してください。"
+            if failures
+            else "処理が完了しました。入力ファイルと出力ファイルは削除していません。"
+        )
+        dialog = self.Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            message_type=message_type,
+            buttons=self.Gtk.ButtonsType.OK,
+            text=text,
+        )
+        dialog.run()
+        dialog.destroy()
+
+
+def _gtk_gui_main(
+    paths: Sequence[str], *, decoder: str, ffprobe: str
+) -> int | None:
+    """Run the GTK GUI, or return None when GTK3 is unavailable."""
+
+    try:
+        import gi
+
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gdk, GLib, Gtk
+    except (ImportError, ValueError):
+        return None
+
+    try:
+        initialized = Gtk.init_check()
+        if initialized is False or (
+            isinstance(initialized, tuple)
+            and initialized
+            and not initialized[0]
+        ):
+            return None
+        app = GtkDecoderApp(
+            Gtk, Gdk, GLib, paths, decoder=decoder, ffprobe=ffprobe
+        )
+        app.window.show_all()
+        Gtk.main()
+    except Exception as exc:
+        print(f"GTK GUIを起動できません: {exc}", file=sys.stderr)
+        return None
+    return 0
+
+
+def _tk_gui_main(
     paths: Sequence[str], *, decoder: str, ffprobe: str
 ) -> int:
     try:
@@ -703,6 +1057,15 @@ def _gui_main(
     DecoderApp(root, paths, decoder=decoder, ffprobe=ffprobe)
     root.mainloop()
     return 0
+
+
+def _gui_main(
+    paths: Sequence[str], *, decoder: str, ffprobe: str
+) -> int:
+    gtk_result = _gtk_gui_main(paths, decoder=decoder, ffprobe=ffprobe)
+    if gtk_result is not None:
+        return gtk_result
+    return _tk_gui_main(paths, decoder=decoder, ffprobe=ffprobe)
 
 
 def build_parser() -> argparse.ArgumentParser:

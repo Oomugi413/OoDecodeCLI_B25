@@ -22,8 +22,9 @@ Linux上で録画TS/M2TSを、ARIB STD-B25復号する小さな独立ツール�
 
 - `arib-b25-stream-test`
 - `ffprobe`（FFmpegに含まれます）
-- Python 3.10以降とTkinter（GUIを使う場合。Debian/Ubuntuなら通常 `python3-tk`）
-- `zenity`（Linux GUIのファイル選択画面。利用できない場合はTkの選択画面へフォールバック）
+- Python 3.10以降とPyGObject/GTK3（GUIを使う場合。Debian/Ubuntuなら通常 `python3-gi` と `gir1.2-gtk-3.0`）
+- Tkinter（GTK3が利用できない場合のGUIフォールバック。Debian/Ubuntuなら通常 `python3-tk`）
+- `zenity`（Tkフォールバック時のLinuxファイル選択画面）
 - `arib-b25-stream-test` がリンクする `libaribb25`（通常はパッケージの実行時依存）
 
 確認例:
@@ -33,6 +34,7 @@ command -v arib-b25-stream-test
 command -v ffprobe
 ldd "$(command -v arib-b25-stream-test)" | grep -i aribb25
 python3 -c 'import tkinter; print("Tkinter OK")'
+python3 -c 'import gi; gi.require_version("Gdk", "3.0"); gi.require_version("Gtk", "3.0"); from gi.repository import Gdk, Gtk; print("GTK3 OK")'
 zenity --version
 ```
 
@@ -56,7 +58,7 @@ cd ~/git/OoDecodeCLI_B25
 ./run.sh
 ```
 
-ウィンドウの「ファイル追加…」で複数ファイルを選べます。GNOME/Wayland環境ではZenityのGTK選択画面を使用します。Tk 8.6標準選択画面で深いディレクトリの上層メニューがクリック解放時に閉じる問題を回避するためです。直前に選択したフォルダは次回も引き継がれます。
+GTK3が利用できる環境ではGTK3のファイル選択画面を使い、ファイラーからアプリのウィンドウへ直接ドラッグ＆ドロップできます。URI形式（日本語・空白を含むパス）にも対応し、直前に選択したフォルダは次回も引き継がれます。GTK3が利用できない場合はTkinter画面へフォールバックします。
 
 デスクトップ上のランチャーへファイルをドロップして起動時の一覧へ渡すこともできます。ランチャーを一度登録するには:
 
